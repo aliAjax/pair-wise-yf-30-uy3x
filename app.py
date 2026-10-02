@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -16,13 +18,38 @@ from urllib.parse import parse_qs, urlparse
 PORT = 8201
 ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
 
+# 审计链创世记录的前一条摘要（64 个 0）
+GENESIS_HASH = "0" * 64
+
+
+def record_digest(*, seq: int, prev_hash: str, case_id: int | None, actor: str,
+                  role: str, action: str, detail_json: str, created_at: str) -> str:
+    """按规范字段重算审计记录摘要，用于挂链与校验。"""
+    material = json.dumps(
+        {
+            "seq": seq,
+            "case_id": case_id,
+            "actor": actor,
+            "role": role,
+            "action": action,
+            "detail": json.loads(detail_json),
+            "created_at": created_at,
+            "prev_hash": prev_hash,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(self, status: int, code: str, message: str, **extra: Any):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.extra = extra
 
 
 def utcnow() -> datetime:
@@ -90,6 +117,7 @@ class Repository:
                 causality TEXT,
                 report_due_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
+                audit_status TEXT NOT NULL DEFAULT 'verified',
                 revision INTEGER NOT NULL DEFAULT 1,
                 merged_into INTEGER REFERENCES cases(id),
                 created_by TEXT NOT NULL,
@@ -147,17 +175,115 @@ class Repository:
                 role TEXT NOT NULL,
                 action TEXT NOT NULL,
                 detail_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                seq INTEGER NOT NULL DEFAULT 0,
+                prev_hash TEXT NOT NULL DEFAULT '',
+                record_hash TEXT NOT NULL DEFAULT ''
             );
             """
         )
+        self._migrate_legacy_schema()
+        self.upgrade_audit_chains()
+
+    def _migrate_legacy_schema(self) -> None:
+        """为旧版本库补齐审计链所需列（SQLite 不支持 ADD COLUMN IF NOT EXISTS）。"""
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(audit_log)")}
+        for column, ddl in (
+            ("seq", "ALTER TABLE audit_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0"),
+            ("prev_hash", "ALTER TABLE audit_log ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''"),
+            ("record_hash", "ALTER TABLE audit_log ADD COLUMN record_hash TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in existing:
+                self.conn.execute(ddl)
+        case_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(cases)")}
+        if "audit_status" not in case_columns:
+            self.conn.execute("ALTER TABLE cases ADD COLUMN audit_status TEXT NOT NULL DEFAULT 'verified'")
+
+    def upgrade_audit_chains(self) -> dict[str, int]:
+        """补齐旧数据的审计链：为从未挂链的记录按序补 seq/prev_hash/record_hash。
+
+        幂等，可在每次启动时执行。已有哈希的记录（可能被篡改）保持原样，
+        交由校验发现，绝不在升级时静默重算。返回补链的案例数与记录数。
+        """
+        upgraded_cases = 0
+        upgraded_records = 0
+        case_ids = [row["id"] for row in self.conn.execute("SELECT id FROM cases ORDER BY id")]
+        for case_id in case_ids:
+            rows = self.conn.execute(
+                "SELECT * FROM audit_log WHERE case_id=? ORDER BY id", (case_id,)
+            ).fetchall()
+            prev_hash = GENESIS_HASH
+            seq = 0
+            changed = False
+            for row in rows:
+                seq += 1
+                if not row["record_hash"]:
+                    digest = record_digest(
+                        seq=seq,
+                        prev_hash=prev_hash,
+                        case_id=row["case_id"],
+                        actor=row["actor"],
+                        role=row["role"],
+                        action=row["action"],
+                        detail_json=row["detail_json"],
+                        created_at=row["created_at"],
+                    )
+                    self.conn.execute(
+                        "UPDATE audit_log SET seq=?, prev_hash=?, record_hash=? WHERE id=?",
+                        (seq, prev_hash, digest, row["id"]),
+                    )
+                    prev_hash = digest
+                    changed = True
+                    upgraded_records += 1
+                else:
+                    prev_hash = row["record_hash"]
+            if changed:
+                upgraded_cases += 1
+        return {"cases": upgraded_cases, "records": upgraded_records}
 
     @staticmethod
-    def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
-        conn.execute(
-            "INSERT INTO audit_log(case_id,actor,role,action,detail_json,created_at) VALUES(?,?,?,?,?,?)",
-            (case_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()),
+    def chain_tail(conn: sqlite3.Connection, case_id: int | None) -> tuple[str, int]:
+        """返回案例当前链尾摘要与序号；无记录时返回创世摘要与 0。"""
+        row = conn.execute(
+            "SELECT record_hash, seq FROM audit_log WHERE case_id IS ? ORDER BY id DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        if not row or not row["record_hash"]:
+            return GENESIS_HASH, 0
+        return row["record_hash"], row["seq"]
+
+    @staticmethod
+    def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str,
+              action: str, detail: dict[str, Any], expected_tail_hash: str | None = None) -> dict[str, Any]:
+        """向案例审计链追加一条记录，自动链接前一条摘要。
+
+        调用方可传入上次读到的 expected_tail_hash 做乐观并发控制：
+        若链尾已被其他追加更新则抛出 409 chain_conflict 并附带当前链尾，
+        调用方应按最新链尾重试。
+        """
+        tail_hash, tail_seq = Repository.chain_tail(conn, case_id)
+        if expected_tail_hash is not None and not hmac.compare_digest(str(expected_tail_hash), tail_hash):
+            raise ApiError(409, "chain_conflict", "审计链尾已被其他追加更新，请按最新链尾重试",
+                           current_tail_hash=tail_hash)
+        seq = tail_seq + 1
+        detail_json = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        created_at = iso()
+        digest = record_digest(
+            seq=seq,
+            prev_hash=tail_hash,
+            case_id=case_id,
+            actor=actor,
+            role=role,
+            action=action,
+            detail_json=detail_json,
+            created_at=created_at,
         )
+        conn.execute(
+            """INSERT INTO audit_log(case_id,actor,role,action,detail_json,created_at,seq,prev_hash,record_hash)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (case_id, actor, role, action, detail_json, created_at, seq, tail_hash, digest),
+        )
+        return {"seq": seq, "prev_hash": tail_hash, "record_hash": digest}
 
     @staticmethod
     def row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -188,6 +314,153 @@ class PharmacovigilanceService:
         if not row:
             raise ApiError(404, "case_not_found", "案例不存在")
         return row
+
+    @staticmethod
+    def _require_auditable(case: sqlite3.Row) -> None:
+        """断链/分叉待核查期间冻结案例的一切变更。"""
+        if case["audit_status"] == "pending_verification":
+            raise ApiError(409, "case_pending_verification",
+                          "案例审计链存在断链或分叉，整案待核查，期间禁止变更；仅全局管理员写明原因后可修复")
+
+    def verify_chain(self, case_id: int, role: str | None = None, region: str | None = None) -> dict[str, Any]:
+        """逐条重算审计链摘要，返回校验结果与最早断点。
+
+        校验项：记录是否从未挂链、序号是否连续（抹去）、前向链接是否吻合
+        （抹去/补插）、本条摘要是否被篡改、是否存在分叉（多条记录指向同一前条）。
+        """
+        conn = self.repo.conn
+        case = self._case(conn, case_id)
+        if role is not None and not self.can_access(case, role, region or ""):
+            raise ApiError(403, "case_forbidden", "无权查看该区域案例审计链")
+        rows = conn.execute("SELECT * FROM audit_log WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
+        expected_prev = GENESIS_HASH
+        expected_seq = 1
+        earliest_break: dict[str, Any] | None = None
+        for row in rows:
+            if not row["record_hash"]:
+                earliest_break = {
+                    "record_id": row["id"], "seq": row["seq"], "reason": "unhashed_record",
+                    "message": "记录未挂链，疑似旧数据升级未完成",
+                }
+                break
+            if row["seq"] != expected_seq:
+                earliest_break = {
+                    "record_id": row["id"], "seq": row["seq"], "reason": "gap",
+                    "expected_seq": expected_seq, "actual_seq": row["seq"],
+                    "message": "序号不连续，疑似有记录被抹去",
+                }
+                break
+            if not hmac.compare_digest(row["prev_hash"], expected_prev):
+                earliest_break = {
+                    "record_id": row["id"], "seq": row["seq"], "reason": "link_mismatch",
+                    "expected_prev_hash": expected_prev, "actual_prev_hash": row["prev_hash"],
+                    "message": "前向链接断裂，前一条摘要对不上，疑似记录被抹去或补插",
+                }
+                break
+            digest = record_digest(
+                seq=row["seq"],
+                prev_hash=row["prev_hash"],
+                case_id=row["case_id"],
+                actor=row["actor"],
+                role=row["role"],
+                action=row["action"],
+                detail_json=row["detail_json"],
+                created_at=row["created_at"],
+            )
+            if not hmac.compare_digest(digest, row["record_hash"]):
+                earliest_break = {
+                    "record_id": row["id"], "seq": row["seq"], "reason": "digest_mismatch",
+                    "expected_hash": digest, "actual_hash": row["record_hash"],
+                    "message": "记录摘要与内容不符，疑似记录被篡改",
+                }
+                break
+            expected_prev = digest
+            expected_seq += 1
+        forks: list[dict[str, Any]] = []
+        fork_break: dict[str, Any] | None = None
+        fork_rows = conn.execute(
+            """SELECT id, seq, prev_hash, COUNT(*) AS c FROM audit_log
+               WHERE case_id=? AND prev_hash!='' GROUP BY prev_hash HAVING c > 1 ORDER BY id""",
+            (case_id,),
+        ).fetchall()
+        for fr in fork_rows:
+            forks.append({
+                "record_id": fr["id"], "seq": fr["seq"], "prev_hash": fr["prev_hash"],
+                "message": "发现分叉：多条记录指向同一条前条摘要，疑似并发补插",
+            })
+            if fork_break is None:
+                fork_break = {
+                    "record_id": fr["id"], "seq": fr["seq"], "reason": "fork",
+                    "prev_hash": fr["prev_hash"],
+                    "message": "发现分叉：多条记录指向同一条前条摘要，疑似并发补插",
+                }
+        if fork_break is not None and (earliest_break is None or fork_break["record_id"] < earliest_break["record_id"]):
+            earliest_break = fork_break
+        tail_hash = rows[-1]["record_hash"] if rows and rows[-1]["record_hash"] else GENESIS_HASH
+        return {
+            "case_id": case_id,
+            "valid": earliest_break is None,
+            "records_checked": len(rows),
+            "tail_hash": tail_hash,
+            "audit_status": case["audit_status"],
+            "earliest_break": earliest_break,
+            "forks": forks,
+        }
+
+    def check_audit_chain(self, case_id: int, actor: str, role: str, region: str) -> dict[str, Any]:
+        """校验审计链；一旦发现断链或分叉，整案进入待核查并冻结变更。"""
+        result = self.verify_chain(case_id, role, region)
+        if not result["valid"] and result["audit_status"] != "pending_verification":
+            with self.repo.tx() as conn:
+                conn.execute(
+                    "UPDATE cases SET audit_status='pending_verification', updated_at=? WHERE id=?",
+                    (iso(), case_id),
+                )
+            result["audit_status"] = "pending_verification"
+        return result
+
+    def repair_chain(self, case_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """全局管理员写明原因后重新挂链修复，修复动作本身写入审计链。"""
+        if role != "global_admin":
+            raise ApiError(403, "repair_forbidden", "只有全局管理员可以修复审计链")
+        reason = str(body.get("reason", "")).strip()
+        if not reason:
+            raise ApiError(400, "reason_required", "修复审计链必须写明原因")
+        with self.repo.tx() as conn:
+            case = self._case(conn, case_id)
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE case_id=? ORDER BY id", (case_id,)
+            ).fetchall()
+            prev_hash = GENESIS_HASH
+            seq = 0
+            relinked = 0
+            for row in rows:
+                seq += 1
+                digest = record_digest(
+                    seq=seq,
+                    prev_hash=prev_hash,
+                    case_id=row["case_id"],
+                    actor=row["actor"],
+                    role=row["role"],
+                    action=row["action"],
+                    detail_json=row["detail_json"],
+                    created_at=row["created_at"],
+                )
+                if row["seq"] != seq or row["prev_hash"] != prev_hash or not hmac.compare_digest(row["record_hash"], digest):
+                    conn.execute(
+                        "UPDATE audit_log SET seq=?, prev_hash=?, record_hash=? WHERE id=?",
+                        (seq, prev_hash, digest, row["id"]),
+                    )
+                    relinked += 1
+                prev_hash = digest
+            Repository.audit(conn, case_id, actor, role, "audit_chain_repaired",
+                             {"reason": reason, "records_relinked": relinked, "records_total": len(rows)})
+            conn.execute(
+                "UPDATE cases SET audit_status='verified', updated_at=? WHERE id=?",
+                (iso(), case_id),
+            )
+        return {"case_id": case_id, "relinked": relinked, "records_total": len(rows),
+                "reason": reason, "audit_status": "verified"}
 
     def create_case(self, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         required = ("patient_ref", "region", "product", "event_term", "source", "dedupe_key")
@@ -242,7 +515,8 @@ class PharmacovigilanceService:
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
             "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
-            "audit": [dict(r) for r in conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
+            "audit": [dict(r) for r in conn.execute("SELECT id,actor,role,action,detail_json,created_at,seq,prev_hash,record_hash FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
+            "audit_chain": self.verify_chain(case_id, role, region) if role in {"medical_reviewer", "global_admin"} else None,
         }
 
     def list_cases(self, role: str, region: str, query: dict[str, list[str]]) -> list[dict[str, Any]]:
@@ -265,12 +539,22 @@ class PharmacovigilanceService:
         expected = body.get("expected_revision")
         if not isinstance(expected, int):
             raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        expected_tail = body.get("expected_tail_hash")
+        if expected_tail is not None and not isinstance(expected_tail, str):
+            raise ApiError(400, "invalid_tail_hash", "expected_tail_hash 必须是字符串")
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region) or role in {"medical_reviewer"}:
                 raise ApiError(403, "followup_forbidden", "当前角色不能提交随访")
             if case["status"] == "merged":
                 raise ApiError(409, "case_merged", "已合并案例不能再更新")
+            self._require_auditable(case)
+            if expected_tail is not None:
+                current_tail, _ = Repository.chain_tail(conn, case_id)
+                if not hmac.compare_digest(str(expected_tail), current_tail):
+                    raise ApiError(409, "chain_conflict",
+                                   "审计链尾已被其他追加更新，请按最新链尾重试",
+                                   current_tail_hash=current_tail)
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例已被其他人员更新，请重新读取")
             revision = case["revision"] + 1
@@ -284,8 +568,10 @@ class PharmacovigilanceService:
                 "UPDATE cases SET revision=?,received_at=?,report_due_at=?,updated_at=? WHERE id=?",
                 (revision, iso(received), iso(due), iso(), case_id),
             )
-            Repository.audit(conn, case_id, actor, role, "followup_added", {"revision": revision, "source": source})
-            return {"case": dict(self._case(conn, case_id)), "revision": revision}
+            tail = Repository.audit(conn, case_id, actor, role, "followup_added",
+                                    {"revision": revision, "source": source},
+                                    expected_tail_hash=expected_tail)
+            return {"case": dict(self._case(conn, case_id)), "revision": revision, "audit_tail": tail}
 
     def medical_review(self, case_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "medical_reviewer":
@@ -307,6 +593,7 @@ class PharmacovigilanceService:
             case = self._case(conn, case_id)
             if case["status"] == "merged":
                 raise ApiError(409, "case_merged", "已合并案例不能审核")
+            self._require_auditable(case)
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例版本已变化")
             revision = expected + 1
@@ -332,6 +619,7 @@ class PharmacovigilanceService:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region):
                 raise ApiError(403, "region_forbidden", "不能为本区域之外案例生成报告")
+            self._require_auditable(case)
             due = report_deadline(parse_time(case["received_at"]), bool(case["serious"]), bool(case["fatal"]))
             try:
                 cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, iso(due), "pending"))
@@ -344,11 +632,13 @@ class PharmacovigilanceService:
         if role not in {"regional_lead", "global_admin"}:
             raise ApiError(403, "submit_forbidden", "当前角色不能提交监管报告")
         with self.repo.tx() as conn:
-            row = conn.execute("SELECT r.*,c.region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
+            row = conn.execute("SELECT r.*,c.region,c.audit_status FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
             if not row:
                 raise ApiError(404, "report_not_found", "报告不存在")
             if not self.can_access(dict(row), role, region):
                 raise ApiError(403, "region_forbidden", "无权提交其他区域报告")
+            if row["audit_status"] == "pending_verification":
+                raise ApiError(409, "case_pending_verification", "案例审计链待核查，期间禁止提交报告")
             if row["status"] == "submitted":
                 return {"report": dict(row), "idempotent": True}
             now = parse_time(body.get("submitted_at"), utcnow())
@@ -370,6 +660,8 @@ class PharmacovigilanceService:
                 return {"case": dict(source), "idempotent": True}
             if target["status"] == "merged" or source["product"].casefold() != target["product"].casefold():
                 raise ApiError(409, "merge_conflict", "目标案例不可用，或产品与来源案例不一致")
+            self._require_auditable(source)
+            self._require_auditable(target)
             conn.execute("UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?", (target_id, iso(), source_id))
             conn.execute("UPDATE intakes SET case_id=? WHERE case_id=?", (target_id, source_id))
             Repository.audit(conn, target_id, actor, role, "case_merged_in", {"source_case_id": source_id})
@@ -438,6 +730,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[2].isdigit() and parts[3] == "audit-chain":
+            return 200, self.service.check_audit_chain(int(parts[2]), actor, role, region)
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
         raise ApiError(404, "not_found", "接口不存在")
@@ -459,6 +753,8 @@ class Handler(BaseHTTPRequestHandler):
                 return 201, self.service.create_report(case_id, actor, role, region, body)
             if action == "merge":
                 return 200, self.service.merge_cases(case_id, actor, role, body)
+            if action == "audit-repair":
+                return 200, self.service.repair_chain(case_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
             return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
         raise ApiError(404, "not_found", "接口不存在")
@@ -480,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
                 status, payload = self._dispatch_post(parsed.path, self._body())
             json_response(self, status, payload)
         except ApiError as exc:
-            json_response(self, exc.status, {"error": exc.code, "message": exc.message})
+            json_response(self, exc.status, {"error": exc.code, "message": exc.message, **exc.extra})
         except Exception as exc:
             print(f"unhandled error: {exc!r}")
             json_response(self, 500, {"error": "internal_error", "message": str(exc)})
